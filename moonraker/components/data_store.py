@@ -8,7 +8,6 @@ from __future__ import annotations
 import logging
 import time
 from collections import deque
-from tornado.ioloop import PeriodicCallback
 
 # Annotation imports
 from typing import (
@@ -21,14 +20,13 @@ from typing import (
     Deque,
 )
 if TYPE_CHECKING:
-    from confighelper import ConfigHelper
-    from websockets import WebRequest
-    from . import klippy_apis
-    APIComp = klippy_apis.KlippyAPI
+    from ..confighelper import ConfigHelper
+    from ..common import WebRequest
+    from .klippy_apis import KlippyAPI as APIComp
     GCQueue = Deque[Dict[str, Any]]
     TempStore = Dict[str, Dict[str, Deque[float]]]
 
-TEMPERATURE_UPDATE_MS = 1000
+TEMP_UPDATE_TIME = 1.
 
 class DataStore:
     def __init__(self, config: ConfigHelper) -> None:
@@ -40,8 +38,9 @@ class DataStore:
         self.last_temps: Dict[str, Tuple[float, ...]] = {}
         self.gcode_queue: GCQueue = deque(maxlen=self.gcode_store_size)
         self.temperature_store: TempStore = {}
-        self.temp_update_cb = PeriodicCallback(
-            self._update_temperature_store, TEMPERATURE_UPDATE_MS)
+        eventloop = self.server.get_event_loop()
+        self.temp_update_timer = eventloop.register_timer(
+            self._update_temperature_store)
 
         # Register status update event
         self.server.register_event_handler(
@@ -50,6 +49,9 @@ class DataStore:
             "server:gcode_response", self._update_gcode_store)
         self.server.register_event_handler(
             "server:klippy_ready", self._init_sensors)
+        self.server.register_event_handler(
+            "klippy_connection:gcode_received", self._store_gcode_command
+        )
 
         # Register endpoints
         self.server.register_endpoint(
@@ -102,12 +104,12 @@ class DataStore:
                     del self.last_temps[sensor]
             # Update initial temperatures
             self._set_current_temps(status)
-            self.temp_update_cb.start()
+            self.temp_update_timer.start()
         else:
             logging.info("No sensors found")
             self.last_temps = {}
             self.temperature_store = {}
-            self.temp_update_cb.stop()
+            self.temp_update_timer.stop()
 
     def _set_current_temps(self, data: Dict[str, Any]) -> None:
         for sensor in self.temperature_store:
@@ -119,7 +121,7 @@ class DataStore:
                     data[sensor].get('power', last_val[2]),
                     data[sensor].get('speed', last_val[3]))
 
-    def _update_temperature_store(self) -> None:
+    def _update_temperature_store(self, eventtime: float) -> float:
         # XXX - If klippy is not connected, set values to zero
         # as they are unknown?
         for sensor, vals in self.last_temps.items():
@@ -127,6 +129,7 @@ class DataStore:
             for val, item in zip(vals[1:], ["targets", "powers", "speeds"]):
                 if item in self.temperature_store[sensor]:
                     self.temperature_store[sensor][item].append(val)
+        return eventtime + TEMP_UPDATE_TIME
 
     async def _handle_temp_store_request(self,
                                          web_request: WebRequest
@@ -137,14 +140,14 @@ class DataStore:
         return store
 
     async def close(self) -> None:
-        self.temp_update_cb.stop()
+        self.temp_update_timer.stop()
 
     def _update_gcode_store(self, response: str) -> None:
         curtime = time.time()
         self.gcode_queue.append(
             {'message': response, 'time': curtime, 'type': "response"})
 
-    def store_gcode_command(self, script: str) -> None:
+    def _store_gcode_command(self, script: str) -> None:
         curtime = time.time()
         for cmd in script.split('\n'):
             cmd = cmd.strip()

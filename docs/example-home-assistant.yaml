@@ -14,8 +14,12 @@ sensor:
       - display_status
       - virtual_sdcard
     value_template: >-
-      {{ 'OK' if ('result' in value_json) else None }}
-
+      {{ 'OK' if ('result' in value_json) else None }}    
+    #  Adding an API key is only necessary while using the [authorization] component
+    #  and if Home Assistant is not a trusted client
+    headers:
+      x-api-key: 123456789abcdefghijklmno
+      
   - platform: template
     sensors:
 
@@ -97,3 +101,11 @@ switch:
       Content-Type: 'application/json'
     is_on_template: >-
       {{ 'result' in value_json and (value_json.result.values() | list | first == "on") }}
+
+#  MJPEG camera can be exposed to HA
+#
+camera:
+  - platform: mjpeg
+    name: Voron_V0_camera
+    still_image_url: http://192.168.178.56/webcam/?action=snapshot
+    mjpeg_url: http://192.168.178.56/webcam/?action=stream

@@ -6,28 +6,57 @@
 
 from __future__ import annotations
 import logging
+import time
 
-from typing import TYPE_CHECKING, Dict, Any
+from typing import TYPE_CHECKING, Dict, Any, Optional
 if TYPE_CHECKING:
-    from confighelper import ConfigHelper
-    from utils import ServerError
+    from ...confighelper import ConfigHelper
+    from ...utils import ServerError
     from .update_manager import CommandHelper
 
 class BaseDeploy:
     def __init__(self,
                  config: ConfigHelper,
-                 cmd_helper: CommandHelper
+                 cmd_helper: CommandHelper,
+                 name: Optional[str] = None,
+                 prefix: str = "",
+                 cfg_hash: Optional[str] = None
                  ) -> None:
-        name_parts = config.get_name().split()
-        self.name = name_parts[-1]
+        if name is None:
+            name = config.get_name().split(maxsplit=1)[-1]
+            if name.startswith("client "):
+                # allow deprecated [update_manager client app] style names
+                name = name[7:]
+        self.name = name
+        if prefix:
+            prefix = f"{prefix} {self.name}: "
+        self.prefix = prefix
         self.server = config.get_server()
         self.cmd_helper = cmd_helper
-        if name_parts == 1:
-            self.prefix: str = ""
-        if config.get('type', "") == "web":
-            self.prefix = f"Web Client {self.name}: "
-        else:
-            self.prefix = f"Application {self.name}: "
+        self.refresh_interval = cmd_helper.get_refresh_interval()
+        refresh_interval = config.getint('refresh_interval', None)
+        if refresh_interval is not None:
+            self.refresh_interval = refresh_interval * 60 * 60
+        if cfg_hash is None:
+            cfg_hash = config.get_hash().hexdigest()
+        self.cfg_hash = cfg_hash
+
+    async def initialize(self) -> Dict[str, Any]:
+        umdb = self.cmd_helper.get_umdb()
+        storage: Dict[str, Any] = await umdb.get(self.name, {})
+        self.last_refresh_time: float = storage.get('last_refresh_time', 0.0)
+        self.last_cfg_hash: str = storage.get('last_config_hash', "")
+        return storage
+
+    def needs_refresh(self) -> bool:
+        next_refresh_time = self.last_refresh_time + self.refresh_interval
+        return (
+            self.cfg_hash != self.last_cfg_hash or
+            time.time() > next_refresh_time
+        )
+
+    def get_last_refresh_time(self) -> float:
+        return self.last_refresh_time
 
     async def refresh(self) -> None:
         pass
@@ -37,6 +66,18 @@ class BaseDeploy:
 
     def get_update_status(self) -> Dict[str, Any]:
         return {}
+
+    def get_persistent_data(self) -> Dict[str, Any]:
+        return {
+            'last_config_hash': self.cfg_hash,
+            'last_refresh_time': self.last_refresh_time
+        }
+
+    def _save_state(self) -> None:
+        umdb = self.cmd_helper.get_umdb()
+        self.last_refresh_time = time.time()
+        self.last_cfg_hash = self.cfg_hash
+        umdb[self.name] = self.get_persistent_data()
 
     def log_exc(self, msg: str, traceback: bool = True) -> ServerError:
         log_msg = f"{self.prefix}{msg}"

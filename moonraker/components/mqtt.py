@@ -10,9 +10,10 @@ import asyncio
 import logging
 import json
 import pathlib
+import ssl
 from collections import deque
 import paho.mqtt.client as paho_mqtt
-from websockets import Subscribable, WebRequest, JsonRPC, APITransport
+from ..common import Subscribable, WebRequest, APITransport, JsonRPC
 
 # Annotation imports
 from typing import (
@@ -29,8 +30,9 @@ from typing import (
     Deque,
 )
 if TYPE_CHECKING:
-    from app import APIDefinition
-    from confighelper import ConfigHelper
+    from ..app import APIDefinition
+    from ..confighelper import ConfigHelper
+    from ..klippy_connection import KlippyConnection as Klippy
     FlexCallback = Callable[[bytes], Optional[Coroutine]]
     RPCCallback = Callable[..., Coroutine]
 
@@ -40,6 +42,114 @@ MQTT_PROTOCOLS = {
     'v3.1.1': paho_mqtt.MQTTv311,
     'v5': paho_mqtt.MQTTv5
 }
+
+class ExtPahoClient(paho_mqtt.Client):
+    # Override reconnection to take a connected socket.  This allows Moonraker
+    # create the socket connection asynchronously
+    def reconnect(self, sock: Optional[socket.socket] = None):
+        """Reconnect the client after a disconnect. Can only be called after
+        connect()/connect_async()."""
+        if len(self._host) == 0:
+            raise ValueError('Invalid host.')
+        if self._port <= 0:
+            raise ValueError('Invalid port number.')
+
+        if hasattr(self, "_out_packet_mutex"):
+            # Paho Mqtt Version < 1.6.x
+            self._in_packet = {
+                "command": 0,
+                "have_remaining": 0,
+                "remaining_count": [],
+                "remaining_mult": 1,
+                "remaining_length": 0,
+                "packet": b"",
+                "to_process": 0,
+                "pos": 0
+            }
+            with self._out_packet_mutex:
+                self._out_packet = deque()  # type: ignore
+
+            with self._current_out_packet_mutex:
+                self._current_out_packet = None
+        else:
+            self._in_packet = {
+                "command": 0,
+                "have_remaining": 0,
+                "remaining_count": [],
+                "remaining_mult": 1,
+                "remaining_length": 0,
+                "packet": bytearray(b""),
+                "to_process": 0,
+                "pos": 0
+            }
+            self._out_packet = deque()  # type: ignore
+
+        with self._msgtime_mutex:
+            self._last_msg_in = paho_mqtt.time_func()
+            self._last_msg_out = paho_mqtt.time_func()
+
+        self._ping_t = 0
+        self._state = paho_mqtt.mqtt_cs_new
+
+        self._sock_close()
+
+        # Put messages in progress in a valid state.
+        self._messages_reconnect_reset()
+
+        if sock is None:
+            sock = self._create_socket_connection()
+
+        if self._ssl:
+            # SSL is only supported when SSLContext is available
+            # (implies Python >= 2.7.9 or >= 3.2)
+
+            verify_host = not self._tls_insecure
+            try:
+                # Try with server_hostname, even it's not supported in
+                # certain scenarios
+                sock = self._ssl_context.wrap_socket(
+                    sock,
+                    server_hostname=self._host,
+                    do_handshake_on_connect=False,
+                )
+            except ssl.CertificateError:
+                # CertificateError is derived from ValueError
+                raise
+            except ValueError:
+                # Python version requires SNI in order to handle
+                # server_hostname, but SNI is not available
+                sock = self._ssl_context.wrap_socket(
+                    sock,
+                    do_handshake_on_connect=False,
+                )
+            else:
+                # If SSL context has already checked hostname, then don't need
+                #  to do it again
+                if (hasattr(self._ssl_context, 'check_hostname') and
+                        self._ssl_context.check_hostname):
+                    verify_host = False
+
+            assert isinstance(sock, ssl.SSLSocket)
+            sock.settimeout(self._keepalive)
+            sock.do_handshake()
+
+            if verify_host:
+                ssl.match_hostname(sock.getpeercert(), self._host)  # type: ignore
+
+        if self._transport == "websockets":
+            sock.settimeout(self._keepalive)
+            sock = paho_mqtt.WebsocketWrapper(
+                sock, self._host, self._port, self._ssl,
+                self._websocket_path, self._websocket_extra_headers
+            )
+
+        self._sock = sock
+        assert self._sock is not None
+        self._sock.setblocking(False)
+        self._registered_write = False
+        self._call_socket_open()
+
+        return self._send_connect(self._keepalive)
 
 class SubscriptionHandle:
     def __init__(self, topic: str, callback: FlexCallback) -> None:
@@ -135,10 +245,15 @@ class MQTTClient(APITransport, Subscribable):
     def __init__(self, config: ConfigHelper) -> None:
         self.server = config.get_server()
         self.event_loop = self.server.get_event_loop()
+        self.klippy: Klippy = self.server.lookup_component("klippy_connection")
         self.address: str = config.get('address')
         self.port: int = config.getint('port', 1883)
-        self.user_name = config.get('username', None)
-        pw_file_path = config.get('password_file', None)
+        user = config.gettemplate('username', None)
+        self.user_name: Optional[str] = None
+        if user:
+            self.user_name = user.render()
+        pw_file_path = config.get('password_file', None, deprecate=True)
+        pw_template = config.gettemplate('password', None)
         self.password: Optional[str] = None
         if pw_file_path is not None:
             pw_file = pathlib.Path(pw_file_path).expanduser().absolute()
@@ -146,6 +261,8 @@ class MQTTClient(APITransport, Subscribable):
                 raise config.error(
                     f"Password file '{pw_file}' does not exist")
             self.password = pw_file.read_text().strip()
+        if pw_template is not None:
+            self.password = pw_template.render()
         protocol = config.get('mqtt_protocol', "v3.1.1")
         self.protocol = MQTT_PROTOCOLS.get(protocol, None)
         if self.protocol is None:
@@ -163,7 +280,9 @@ class MQTTClient(APITransport, Subscribable):
             raise config.error(
                 "Option 'default_qos' in section [mqtt] must be "
                 "between 0 and 2")
-        self.client = paho_mqtt.Client(protocol=self.protocol)
+        self.publish_split_status = \
+            config.getboolean("publish_split_status", False)
+        self.client = ExtPahoClient(protocol=self.protocol)
         self.client.on_connect = self._on_connect
         self.client.on_message = self._on_message
         self.client.on_disconnect = self._on_disconnect
@@ -172,7 +291,7 @@ class MQTTClient(APITransport, Subscribable):
         self.client.on_unsubscribe = self._on_unsubscribe
         self.connect_evt: asyncio.Event = asyncio.Event()
         self.disconnect_evt: Optional[asyncio.Event] = None
-        self.reconnect_task: Optional[asyncio.Task] = None
+        self.connect_task: Optional[asyncio.Task] = None
         self.subscribed_topics: SubscribedDict = {}
         self.pending_responses: List[asyncio.Future] = []
         self.pending_acks: Dict[int, asyncio.Future] = {}
@@ -180,17 +299,18 @@ class MQTTClient(APITransport, Subscribable):
         self.server.register_endpoint(
             "/server/mqtt/publish", ["POST"],
             self._handle_publish_request,
-            transports=["http", "websocket"])
+            transports=["http", "websocket", "internal"])
         self.server.register_endpoint(
             "/server/mqtt/subscribe", ["POST"],
             self._handle_subscription_request,
-            transports=["http", "websocket"])
+            transports=["http", "websocket", "internal"])
 
         # Subscribe to API requests
-        self.json_rpc = JsonRPC(transport="MQTT")
+        self.json_rpc = JsonRPC(self.server, transport="MQTT")
         self.api_request_topic = f"{self.instance_name}/moonraker/api/request"
         self.api_resp_topic = f"{self.instance_name}/moonraker/api/response"
         self.klipper_status_topic = f"{self.instance_name}/klipper/status"
+        self.klipper_state_prefix = f"{self.instance_name}/klipper/state"
         self.moonraker_status_topic = f"{self.instance_name}/moonraker/status"
         status_cfg: Dict[str, Any] = config.getdict("status_objects", {},
                                                     allow_empty_fields=True)
@@ -203,8 +323,9 @@ class MQTTClient(APITransport, Subscribable):
                 self.status_objs[key] = None
         if status_cfg:
             logging.debug(f"MQTT: Status Objects Set: {self.status_objs}")
-            self.server.register_event_handler("server:klippy_identified",
-                                               self._handle_klippy_identified)
+            self.server.register_event_handler(
+                "server:klippy_started", self._handle_klippy_started
+            )
 
         self.timestamp_deque: Deque = deque(maxlen=20)
         self.api_qos = config.getint('api_qos', self.qos)
@@ -216,43 +337,35 @@ class MQTTClient(APITransport, Subscribable):
             self.subscribe_topic(self.api_request_topic,
                                  self._process_api_request,
                                  self.api_qos)
-            logging.info(
-                f"Moonraker API topics - Request: {self.api_request_topic}, "
-                f"Response: {self.api_resp_topic}")
+
+        self.server.register_remote_method("publish_mqtt_topic",
+                                           self._publish_from_klipper)
+        logging.info(
+            f"\nReserved MQTT topics:\n"
+            f"API Request: {self.api_request_topic}\n"
+            f"API Response: {self.api_resp_topic}\n"
+            f"Moonraker Status: {self.moonraker_status_topic}\n"
+            f"Klipper Status: {self.klipper_status_topic}")
 
     async def component_init(self) -> None:
         # We must wait for the IOLoop (asyncio event loop) to start
-        # prior to retreiving it
+        # prior to retrieving it
         self.helper = AIOHelper(self.client)
         if self.user_name is not None:
             self.client.username_pw_set(self.user_name, self.password)
         self.client.will_set(self.moonraker_status_topic,
                              payload=json.dumps({'server': 'offline'}),
                              qos=self.qos, retain=True)
-        retries = 5
-        for _ in range(retries):
-            try:
-                self.client.connect(self.address, self.port)
-            except (ConnectionRefusedError, socket.gaierror) as e:
-                logging.info(f"MQTT connection error, {e}, "
-                             f"retries remaining: {retries}")
-                await asyncio.sleep(2.)
-            else:
-                break
-        else:
-            self.server.set_failed_component("mqtt")
-            self.server.add_warning(
-                f"MQTT Broker Connection at ({self.address}, {self.port}) "
-                "refused. Check your client and broker configuration.")
-            return
-        self.client.socket().setsockopt(
-            socket.SOL_SOCKET, socket.SO_SNDBUF, 2048)
+        self.client.connect_async(self.address, self.port)
+        self.connect_task = self.event_loop.create_task(
+            self._do_reconnect(first=True)
+        )
 
-    async def _handle_klippy_identified(self) -> None:
+    async def _handle_klippy_started(self, state: str) -> None:
         if self.status_objs:
             args = {'objects': self.status_objs}
             try:
-                await self.server.make_request(
+                await self.klippy.request(
                     WebRequest("objects/subscribe", args, conn=self))
             except self.server.error:
                 pass
@@ -294,6 +407,7 @@ class MQTTClient(APITransport, Subscribable):
                         BrokerAckLogger(topics, "subscribe"))
                     self.pending_acks[msg_id] = sub_fut
             self.connect_evt.set()
+            self.server.send_event("mqtt:connected")
         else:
             if isinstance(reason_code, int):
                 err_str = paho_mqtt.connack_string(reason_code)
@@ -314,8 +428,9 @@ class MQTTClient(APITransport, Subscribable):
             # The server connection was dropped, attempt to reconnect
             logging.info("MQTT Server Disconnected, reason: "
                          f"{paho_mqtt.error_string(reason_code)}")
-            if self.reconnect_task is None:
-                self.reconnect_task = asyncio.create_task(self._do_reconnect())
+            if self.connect_task is None:
+                self.connect_task = asyncio.create_task(self._do_reconnect())
+            self.server.send_event("mqtt:disconnected")
         self.connect_evt.clear()
 
     def _on_publish(self,
@@ -349,21 +464,32 @@ class MQTTClient(APITransport, Subscribable):
         if unsub_fut is not None and not unsub_fut.done():
             unsub_fut.set_result(None)
 
-    async def _do_reconnect(self) -> None:
-        logging.info("Attempting MQTT Reconnect")
+    async def _do_reconnect(self, first: bool = False) -> None:
+        logging.info("Attempting MQTT Connect/Reconnect")
+        last_err: Exception = Exception()
         while True:
+            if not first:
+                try:
+                    await asyncio.sleep(2.)
+                except asyncio.CancelledError:
+                    raise
+            first = False
             try:
-                await asyncio.sleep(2.)
+                sock = await self.event_loop.create_socket_connection(
+                    (self.address, self.port), timeout=10
+                )
+                self.client.reconnect(sock)
             except asyncio.CancelledError:
-                break
-            try:
-                self.client.reconnect()
-            except (ConnectionRefusedError, socket.gaierror):
+                raise
+            except Exception as e:
+                if type(last_err) != type(e) or last_err.args != e.args:
+                    logging.exception("MQTT Connection Error")
+                    last_err = e
                 continue
             self.client.socket().setsockopt(
                 socket.SOL_SOCKET, socket.SO_SNDBUF, 2048)
             break
-        self.reconnect_task = None
+        self.connect_task = None
 
     async def wait_connection(self, timeout: Optional[float] = None) -> bool:
         try:
@@ -575,18 +701,16 @@ class MQTTClient(APITransport, Subscribable):
                                  request_method: str,
                                  callback: Callable[[WebRequest], Coroutine]
                                  ) -> RPCCallback:
-        async def func(**kwargs) -> Any:
-            self._check_timestamp(kwargs)
-            result = await callback(
-                WebRequest(endpoint, kwargs, request_method))
+        async def func(args: Dict[str, Any]) -> Any:
+            self._check_timestamp(args)
+            result = await callback(WebRequest(endpoint, args, request_method))
             return result
         return func
 
     def _generate_remote_callback(self, endpoint: str) -> RPCCallback:
-        async def func(**kwargs) -> Any:
-            self._check_timestamp(kwargs)
-            result = await self.server.make_request(
-                WebRequest(endpoint, kwargs))
+        async def func(args: Dict[str, Any]) -> Any:
+            self._check_timestamp(args)
+            result = await self.klippy.request(WebRequest(endpoint, args))
             return result
         return func
 
@@ -606,13 +730,27 @@ class MQTTClient(APITransport, Subscribable):
                     ) -> None:
         if not status or not self.is_connected():
             return
-        payload = {'eventtime': eventtime, 'status': status}
-        self.publish_topic(self.klipper_status_topic, payload)
+        if self.publish_split_status:
+            for objkey in status:
+                objval = status[objkey]
+                for statekey in objval:
+                    payload = {'eventtime': eventtime,
+                               'value': objval[statekey]}
+                    self.publish_topic(
+                        f"{self.klipper_state_prefix}/{objkey}/{statekey}",
+                        payload, retain=True)
+        else:
+            payload = {'eventtime': eventtime, 'status': status}
+            self.publish_topic(self.klipper_status_topic, payload)
+
+
+    def get_instance_name(self) -> str:
+        return self.instance_name
 
     async def close(self) -> None:
-        if self.reconnect_task is not None:
-            self.reconnect_task.cancel()
-            self.reconnect_task = None
+        if self.connect_task is not None:
+            self.connect_task.cancel()
+            self.connect_task = None
         if not self.is_connected():
             return
         await self.publish_topic(self.moonraker_status_topic,
@@ -631,6 +769,17 @@ class MQTTClient(APITransport, Subscribable):
                 continue
             fut.set_exception(
                 self.server.error("Moonraker Shutdown", 503))
+
+    async def _publish_from_klipper(self,
+                                    topic: str,
+                                    payload: Any = None,
+                                    qos: Optional[int] = None,
+                                    retain: bool = False,
+                                    use_prefix: bool = False
+                                    ) -> None:
+        if use_prefix:
+            topic = f"{self.instance_name}/{topic.lstrip('/')}"
+        await self.publish_topic(topic, payload, qos, retain)
 
 
 def load_component(config: ConfigHelper) -> MQTTClient:

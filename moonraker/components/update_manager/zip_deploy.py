@@ -5,17 +5,15 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 
 from __future__ import annotations
-import asyncio
 import os
 import pathlib
 import json
 import shutil
 import re
 import time
-import tempfile
 import zipfile
 from .app_deploy import AppDeploy
-from utils import verify_source
+from ...utils import verify_source
 
 # Annotation imports
 from typing import (
@@ -27,7 +25,7 @@ from typing import (
     List,
 )
 if TYPE_CHECKING:
-    from confighelper import ConfigHelper
+    from ...confighelper import ConfigHelper
     from .update_manager import CommandHelper
 
 RINFO_KEYS = [
@@ -37,12 +35,9 @@ RINFO_KEYS = [
 ]
 
 class ZipDeploy(AppDeploy):
-    def __init__(self,
-                 config: ConfigHelper,
-                 cmd_helper: CommandHelper,
-                 app_params: Optional[Dict[str, Any]] = None
-                 ) -> None:
-        super().__init__(config, cmd_helper, app_params)
+    def __init__(self, config: ConfigHelper, cmd_helper: CommandHelper) -> None:
+        super().__init__(config, cmd_helper)
+        self.need_channel_update = self.type != "zip"
         self.official_repo: str = "?"
         self.owner: str = "?"
         # Extract repo from origin for validation
@@ -56,31 +51,51 @@ class ZipDeploy(AppDeploy):
                 "Invalid url set for 'origin' option in section "
                 f"[{config.get_name()}].  Unable to extract owner/repo.")
         self.host_repo: str = config.get('host_repo', self.official_repo)
-        self.detected_type: str = "?"
-        self.source_checksum: str = ""
-        self.pristine = False
-        self.verified = False
-        self.build_date: int = 0
-        self.full_version: str = "?"
-        self.short_version: str = "?"
-        self.commit_hash: str = "?"
-        self.lastest_hash: str = "?"
-        self.latest_version: str = "?"
-        self.latest_checksum: str = "?"
-        self.latest_build_date: int = 0
-        self.commit_log: List[Dict[str, Any]] = []
         self.package_list: List[str] = []
         self.python_pkg_list: List[str] = []
         self.release_download_info: Tuple[str, str, int] = ("?", "?", 0)
-        self.errors: List[str] = []
-        self.mutex: asyncio.Lock = asyncio.Lock()
-        self.refresh_event: Optional[asyncio.Event] = None
 
     @staticmethod
     async def from_application(app: AppDeploy) -> ZipDeploy:
-        new_app = ZipDeploy(app.config, app.cmd_helper, app.app_params)
+        new_app = ZipDeploy(app.config, app.cmd_helper)
         await new_app.reinstall()
         return new_app
+
+    async def initialize(self) -> Dict[str, Any]:
+        storage = await super().initialize()
+        self.source_checksum: str = storage.get("source_checksum", "?")
+        self.pristine = storage.get('pristine', False)
+        self.verified = storage.get('verified', False)
+        self.build_date: int = storage.get('build_date', 0)
+        self.full_version: str = storage.get('full_version', "?")
+        self.short_version: str = storage.get('short_version', "?")
+        self.commit_hash: str = storage.get('commit_hash', "?")
+        self.lastest_hash: str = storage.get('latest_hash', "?")
+        self.latest_version: str = storage.get('latest_version', "?")
+        self.latest_checksum: str = storage.get('latest_checksum', "?")
+        self.latest_build_date: int = storage.get('latest_build_date', 0)
+        self.errors: List[str] = storage.get('errors', [])
+        self.commit_log: List[Dict[str, Any]] = storage.get('commit_log', [])
+        return storage
+
+    def get_persistent_data(self) -> Dict[str, Any]:
+        storage = super().get_persistent_data()
+        storage.update({
+            'source_checksum': self.source_checksum,
+            'pristine': self.pristine,
+            'verified': self.verified,
+            'build_date': self.build_date,
+            'full_version': self.full_version,
+            'short_version': self.short_version,
+            'commit_hash': self.commit_hash,
+            'latest_hash': self.lastest_hash,
+            'latest_version': self.latest_version,
+            'latest_checksum': self.latest_checksum,
+            'latest_build_date': self.latest_build_date,
+            'commit_log': self.commit_log,
+            'errors': self.errors
+        })
+        return storage
 
     async def _parse_info_file(self, file_name: str) -> Dict[str, Any]:
         info_file = self.path.joinpath(file_name)
@@ -104,18 +119,11 @@ class ZipDeploy(AppDeploy):
         return tag_version
 
     async def refresh(self) -> None:
-        if self.refresh_event is not None:
-            await self.refresh_event.wait()
-            return
-        async with self.mutex:
-            self.refresh_event = asyncio.Event()
-            try:
-                await self._update_repo_state()
-            except Exception:
-                self.verified = False
-                self.log_exc("Error refreshing application state")
-            self.refresh_event.set()
-            self.refresh_event = None
+        try:
+            await self._update_repo_state()
+        except Exception:
+            self.verified = False
+            self.log_exc("Error refreshing application state")
 
     async def _update_repo_state(self) -> None:
         self.errors = []
@@ -126,15 +134,10 @@ class ZipDeploy(AppDeploy):
         for key in RINFO_KEYS:
             if key not in release_info:
                 self._add_error(f"Missing release info item: {key}")
-        self.detected_type = "?"
-        self.need_channel_update = self.channel == "dev"
         if 'channel' in release_info:
             local_channel = release_info['channel']
             if self.channel == "stable" and local_channel == "beta":
                 self.need_channel_update = True
-            self.detected_type = "zip"
-            if local_channel == "beta":
-                self.detected_type = "zip_beta"
         self.full_version = release_info.get('long_version', "?")
         self.short_version = self._get_tag_version(
             release_info.get('git_version', ""))
@@ -162,7 +165,7 @@ class ZipDeploy(AppDeploy):
         self.package_list = sorted(dep_info.get(
             'debian', {}).get('packages', []))
         self.python_pkg_list = sorted(dep_info.get('python', []))
-        # Retreive version info from github to check for updates and
+        # Retrieve version info from github to check for updates and
         # validate local release info
         host_repo = release_info.get('host_repo', "?")
         release_tag = release_info.get('release_tag', "?")
@@ -171,21 +174,25 @@ class ZipDeploy(AppDeploy):
                 f"Host repo mismatch, received: {host_repo}, "
                 f"expected: {self.host_repo}. This could result in "
                 " a failed update.")
-        url = f"https://api.github.com/repos/{self.host_repo}/releases"
+        resource = f"repos/{self.host_repo}/releases"
         current_release, latest_release = await self._fetch_github_releases(
-            url, release_tag)
+            resource, release_tag)
         await self._validate_current_release(release_info, current_release)
         if not self.errors:
             self.verified = True
         await self._process_latest_release(latest_release)
+        self._save_state()
         self._log_zipapp_info()
 
     async def _fetch_github_releases(self,
-                                     release_url: str,
+                                     resource: str,
                                      current_tag: Optional[str] = None
                                      ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         try:
-            releases = await self.cmd_helper.github_api_request(release_url)
+            client = self.cmd_helper.get_http_client()
+            resp = await client.github_api_request(resource, attempts=3)
+            resp.raise_for_status()
+            releases = resp.json()
             assert isinstance(releases, list)
         except Exception:
             self.log_exc("Error fetching releases from GitHub")
@@ -222,8 +229,8 @@ class ZipDeploy(AppDeploy):
             self._add_error(
                 "RELEASE_INFO not found in current release assets")
         info_url, content_type, size = asset_info['RELEASE_INFO']
-        rinfo_bytes = await self.cmd_helper.http_download_request(
-            info_url, content_type)
+        client = self.cmd_helper.get_http_client()
+        rinfo_bytes = await client.get_file(info_url, content_type)
         github_rinfo: Dict[str, Any] = json.loads(rinfo_bytes)
         if github_rinfo.get(self.name, {}) != release_info:
             self._add_error(
@@ -240,8 +247,8 @@ class ZipDeploy(AppDeploy):
         asset_info = self._get_asset_urls(release, asset_names)
         if "RELEASE_INFO" in asset_info:
             asset_url, content_type, size = asset_info['RELEASE_INFO']
-            rinfo_bytes = await self.cmd_helper.http_download_request(
-                asset_url, content_type)
+            client = self.cmd_helper.get_http_client()
+            rinfo_bytes = await client.get_file(asset_url, content_type)
             update_release_info: Dict[str, Any] = json.loads(rinfo_bytes)
             update_info = update_release_info.get(self.name, {})
             self.lastest_hash = update_info.get('commit_hash', "?")
@@ -257,8 +264,8 @@ class ZipDeploy(AppDeploy):
             # Only report commit log if versions change
             if "COMMIT_LOG" in asset_info:
                 asset_url, content_type, size = asset_info['COMMIT_LOG']
-                commit_bytes = await self.cmd_helper.http_download_request(
-                    asset_url, content_type)
+                client = self.cmd_helper.get_http_client()
+                commit_bytes = await client.get_file(asset_url, content_type)
                 commit_info: Dict[str, Any] = json.loads(commit_bytes)
                 self.commit_log = commit_info.get(self.name, [])
         if zip_file_name in asset_info:
@@ -330,7 +337,7 @@ class ZipDeploy(AppDeploy):
                 await self._install_packages(system_pkgs)
         if python_pkgs:
             if force or python_pkgs != self.python_pkg_list:
-                await self._update_virtualenv(python_pkgs)
+                await self._update_python_requirements(python_pkgs)
         ret = await self._check_need_update(npm_hash, self.npm_pkg_json)
         if force or ret:
             if self.npm_pkg_json is not None:
@@ -350,45 +357,53 @@ class ZipDeploy(AppDeploy):
             zf.extractall(self.path)
 
     async def update(self, force_dep_update: bool = False) -> bool:
-        async with self.mutex:
-            if not self._is_valid:
-                raise self.log_exc("Update aborted, repo not valid", False)
-            if self.short_version == self.latest_version:
-                # already up to date
-                return False
-            self.cmd_helper.notify_update_response(
-                f"Updating Application {self.name}...")
-            npm_hash = await self._get_file_hash(self.npm_pkg_json)
-            dl_url, content_type, size = self.release_download_info
-            self.notify_status("Starting Download...")
-            with tempfile.TemporaryDirectory(
-                    suffix=self.name, prefix="app") as tempdirname:
-                tempdir = pathlib.Path(tempdirname)
-                temp_download_file = tempdir.joinpath(f"{self.name}.zip")
-                await self.cmd_helper.streaming_download_request(
-                    dl_url, temp_download_file, content_type, size)
-                self.notify_status(
-                    f"Download Complete, extracting release to '{self.path}'")
-                event_loop = self.server.get_event_loop()
-                await event_loop.run_in_thread(
-                    self._extract_release, temp_download_file)
-            await self._update_dependencies(npm_hash, force=force_dep_update)
-            await self._update_repo_state()
-            await self.restart_service()
-            self.notify_status("Update Finished...", is_complete=True)
-            return True
+        if not self._is_valid:
+            raise self.log_exc("Update aborted, repo not valid", False)
+        if self.short_version == self.latest_version:
+            # already up to date
+            return False
+        self.cmd_helper.notify_update_response(
+            f"Updating Application {self.name}...")
+        npm_hash = await self._get_file_hash(self.npm_pkg_json)
+        dl_url, content_type, size = self.release_download_info
+        self.notify_status("Starting Download...")
+        td = await self.cmd_helper.create_tempdir(self.name, "app")
+        try:
+            tempdir = pathlib.Path(td.name)
+            temp_download_file = tempdir.joinpath(f"{self.name}.zip")
+            client = self.cmd_helper.get_http_client()
+            await client.download_file(
+                dl_url, content_type, temp_download_file, size,
+                self.cmd_helper.on_download_progress)
+            self.notify_status(
+                f"Download Complete, extracting release to '{self.path}'")
+            event_loop = self.server.get_event_loop()
+            await event_loop.run_in_thread(
+                self._extract_release, temp_download_file)
+        finally:
+            await event_loop.run_in_thread(td.cleanup)
+        await self._update_dependencies(npm_hash, force=force_dep_update)
+        await self._update_repo_state()
+        await self.restart_service()
+        self.notify_status("Update Finished...", is_complete=True)
+        return True
 
     async def recover(self,
                       hard: bool = False,
                       force_dep_update: bool = False
                       ) -> None:
-        async with self.mutex:
-            url = f"https://api.github.com/repos/{self.host_repo}/releases"
-            releases = await self._fetch_github_releases(url)
-            await self._process_latest_release(releases[1])
+        res = f"repos/{self.host_repo}/releases"
+        releases = await self._fetch_github_releases(res)
+        await self._process_latest_release(releases[1])
         await self.update(force_dep_update=force_dep_update)
 
     async def reinstall(self) -> None:
+        # Clear the persistent storage prior to a channel swap.
+        # After the next update is complete new data will be
+        # restored.
+        umdb = self.cmd_helper.get_umdb()
+        await umdb.pop(self.name, None)
+        await self.initialize()
         await self.recover(force_dep_update=True)
 
     def get_update_status(self) -> Dict[str, Any]:
@@ -398,7 +413,7 @@ class ZipDeploy(AppDeploy):
         # client functionality.  In the future it would be
         # good to report values that are specifc
         status.update({
-            'detected_type': self.detected_type,
+            'detected_type': "zip",
             'remote_alias': "origin",
             'branch': "master",
             'owner': self.owner,

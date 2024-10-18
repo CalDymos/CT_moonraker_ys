@@ -1,4 +1,4 @@
-# Octoprint API compatibility
+# OctoPrint API compatibility
 #
 # Copyright (C) 2021 Nickolas Grigoriadis <nagrigoriadis@gmail.com>
 #
@@ -15,20 +15,21 @@ from typing import (
     List,
 )
 if TYPE_CHECKING:
-    from confighelper import ConfigHelper
-    from websockets import WebRequest
-    from . import klippy_apis
-    APIComp = klippy_apis.KlippyAPI
+    from ..confighelper import ConfigHelper
+    from ..common import WebRequest
+    from .klippy_apis import KlippyAPI as APIComp
+    from .file_manager.file_manager import FileManager
+    from .job_queue import JobQueue
 
 OCTO_VERSION = '1.5.0'
 
 
-class OctoprintCompat:
+class OctoPrintCompat:
     """
     Minimal implementation of the REST API as described here:
     https://docs.octoprint.org/en/master/api/index.html
 
-    So that Cura Octoprint plugin will function for:
+    So that Cura OctoPrint plugin will function for:
     * Handshake
     * Upload gcode/ufp
     * Webcam config
@@ -40,6 +41,16 @@ class OctoprintCompat:
         self.server = config.get_server()
         self.software_version = self.server.get_app_args().get(
             'software_version')
+        self.enable_ufp: bool = config.getboolean('enable_ufp', True)
+
+        # Get webcam settings from config
+        self.webcam: Dict[str, Any] = {
+            'flipH': config.getboolean('flip_h', False),
+            'flipV': config.getboolean('flip_v', False),
+            'rotate90': config.getboolean('rotate_90', False),
+            'streamUrl': config.get('stream_url', '/webcam/?action=stream'),
+            'webcamEnabled': config.getboolean('webcam_enabled', True),
+        }
 
         # Local variables
         self.klippy_apis: APIComp = self.server.lookup_component('klippy_apis')
@@ -94,6 +105,13 @@ class OctoprintCompat:
         self.server.register_endpoint(
             '/api/printerprofiles', ['GET'], self._get_printerprofiles,
             transports=['http'], wrap_result=False)
+
+        # Upload Handlers
+        self.server.register_upload_handler(
+            "/api/files/local", location_prefix="api/files/moonraker")
+        self.server.register_endpoint(
+            "/api/files/moonraker/(?P<relative_path>.+)", ['POST'],
+            self._select_file, transports=['http'], wrap_result=False)
 
         # System
         # TODO: shutdown/reboot/restart operations
@@ -206,13 +224,18 @@ class OctoprintCompat:
                             web_request: WebRequest
                             ) -> Dict[str, Any]:
         """
-        Used to parse Octoprint capabilities
-
-        Hardcode capabilities to be basically there and use default
-        fluid/mainsail webcam path.
+        Used to parse OctoPrint capabilities
         """
-        return {
-            'plugins': {
+        settings = {
+            'plugins': {},
+            'feature': {
+                'sdSupport': False,
+                'temperatureGraph': False
+            },
+            'webcam': self.webcam,
+        }
+        if self.enable_ufp:
+            settings['plugins'] = {
                 'UltimakerFormatPackage': {
                     'align_inline_thumbnail': False,
                     'inline_thumbnail': False,
@@ -223,21 +246,8 @@ class OctoprintCompat:
                     'scale_inline_thumbnail': False,
                     'state_panel_thumbnail': True,
                 },
-            },
-            'feature': {
-                'sdSupport': False,
-                'temperatureGraph': False
-            },
-            # TODO: Get webcam settings from config file to allow user
-            #       to customise this.
-            'webcam': {
-                'flipH': False,
-                'flipV': False,
-                'rotate90': False,
-                'streamUrl': '/webcam/?action=stream',
-                'webcamEnabled': True,
-            },
-        }
+            }
+        return settings
 
     async def _get_job(self,
                        web_request: WebRequest
@@ -320,10 +330,71 @@ class OctoprintCompat:
                     'current': True,
                     'heatedBed': 'heater_bed' in self.heaters,
                     'heatedChamber': 'chamber' in self.heaters,
+                    'axes': {
+                        'x': {
+                            'speed': 6000.,
+                            'inverted': False
+                        },
+                        'y': {
+                            'speed': 6000.,
+                            'inverted': False
+                        },
+                        'z': {
+                            'speed': 6000.,
+                            'inverted': False
+                        },
+                        'e': {
+                            'speed': 300.,
+                            'inverted': False
+                        }
+                    }
                 }
             }
         }
 
+    async def _select_file(self,
+                           web_request: WebRequest
+                           ) -> None:
+        command: str = web_request.get_str('command')
+        rel_path: str = web_request.get_str('relative_path')
+        root, filename = rel_path.strip("/").split("/", 1)
+        fmgr: FileManager = self.server.lookup_component('file_manager')
+        if command == "select":
+            start_print: bool = web_request.get_boolean('print', False)
+            if not start_print:
+                # No-op, selecting a file has no meaning in Moonraker
+                return
+            if root != "gcodes":
+                raise self.server.error(
+                    "File must be located in the 'gcodes' root", 400)
+            if not fmgr.check_file_exists(root, filename):
+                raise self.server.error("File does not exist")
+            try:
+                ret = await self.klippy_apis.query_objects(
+                    {'print_stats': None})
+                pstate: str = ret['print_stats']['state']
+            except self.server.error:
+                pstate = "not_avail"
+            started: bool = False
+            if pstate not in ["printing", "paused", "not_avail"]:
+                try:
+                    await self.klippy_apis.start_print(filename)
+                except self.server.error:
+                    started = False
+                else:
+                    logging.debug(f"Job '{filename}' started via OctoPrint API")
+                    started = True
+            if not started:
+                if fmgr.upload_queue_enabled():
+                    job_queue: JobQueue = self.server.lookup_component(
+                        'job_queue')
+                    await job_queue.queue_job(filename, check_exists=False)
+                    logging.debug(f"Job '{filename}' queued via OctoPrint API")
+                else:
+                    raise self.server.error("Conflict", 409)
+        else:
+            raise self.server.error(f"Unsupported Command: {command}")
 
-def load_component(config: ConfigHelper) -> OctoprintCompat:
-    return OctoprintCompat(config)
+
+def load_component(config: ConfigHelper) -> OctoPrintCompat:
+    return OctoPrintCompat(config)

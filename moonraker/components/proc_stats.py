@@ -12,28 +12,33 @@ import os
 import pathlib
 import logging
 from collections import deque
-from tornado.ioloop import PeriodicCallback
 
 # Annotation imports
 from typing import (
     TYPE_CHECKING,
+    Awaitable,
+    Callable,
     Deque,
     Any,
+    List,
     Tuple,
     Optional,
     Dict,
 )
 if TYPE_CHECKING:
-    from confighelper import ConfigHelper
-    from websockets import WebRequest
+    from ..confighelper import ConfigHelper
+    from ..common import WebRequest
+    from ..websockets import WebsocketManager
     from . import shell_command
-    from .machine import Machine
+    STAT_CALLBACK = Callable[[int], Optional[Awaitable]]
 
 VC_GEN_CMD_FILE = "/usr/bin/vcgencmd"
 STATM_FILE_PATH = "/proc/self/smaps_rollup"
 NET_DEV_PATH = "/proc/net/dev"
 TEMPERATURE_PATH = "/sys/class/thermal/thermal_zone0/temp"
-STAT_UPDATE_TIME_MS = 1000
+CPU_STAT_PATH = "/proc/stat"
+MEM_AVAIL_PATH = "/proc/meminfo"
+STAT_UPDATE_TIME = 1.
 REPORT_QUEUE_SIZE = 30
 THROTTLE_CHECK_INTERVAL = 10
 WATCHDOG_REFRESH_TIME = 2.
@@ -54,10 +59,9 @@ class ProcStats:
     def __init__(self, config: ConfigHelper) -> None:
         self.server = config.get_server()
         self.event_loop = self.server.get_event_loop()
-        self.machine: Machine = self.server.load_component(config, 'machine')
         self.watchdog = Watchdog(self)
-        self.stat_update_cb = PeriodicCallback(
-            self._handle_stat_update, STAT_UPDATE_TIME_MS)  # type: ignore
+        self.stat_update_timer = self.event_loop.register_timer(
+            self._handle_stat_update)
         self.vcgencmd: Optional[shell_command.ShellCommand] = None
         if os.path.exists(VC_GEN_CMD_FILE):
             logging.info("Detected 'vcgencmd', throttle checking enabled")
@@ -72,6 +76,8 @@ class ProcStats:
         self.temp_file = pathlib.Path(TEMPERATURE_PATH)
         self.smaps = pathlib.Path(STATM_FILE_PATH)
         self.netdev_file = pathlib.Path(NET_DEV_PATH)
+        self.cpu_stats_file = pathlib.Path(CPU_STAT_PATH)
+        self.meminfo_file = pathlib.Path(MEM_AVAIL_PATH)
         self.server.register_endpoint(
             "/machine/proc_stats", ["GET"], self._handle_stat_request)
         self.server.register_event_handler(
@@ -85,8 +91,17 @@ class ProcStats:
         self.last_throttled: int = 0
         self.update_sequence: int = 0
         self.last_net_stats: Dict[str, Dict[str, Any]] = {}
-        self.stat_update_cb.start()
+        self.last_cpu_stats: Dict[str, Tuple[int, int]] = {}
+        self.cpu_usage: Dict[str, float] = {}
+        self.memory_usage: Dict[str, int] = {}
+        self.stat_callbacks: List[STAT_CALLBACK] = []
+
+    async def component_init(self) -> None:
+        self.stat_update_timer.start()
         self.watchdog.start()
+
+    def register_stat_callback(self, callback: STAT_CALLBACK) -> None:
+        self.stat_callbacks.append(callback)
 
     async def _handle_stat_request(self,
                                    web_request: WebRequest
@@ -96,12 +111,16 @@ class ProcStats:
             ts = await self._check_throttled_state()
         cpu_temp = await self.event_loop.run_in_thread(
             self._get_cpu_temperature)
-        websocket_count = self.server.get_websocket_manager().get_count()
+        wsm: WebsocketManager = self.server.lookup_component("websockets")
+        websocket_count = wsm.get_count()
         return {
             'moonraker_stats': list(self.proc_stat_queue),
             'throttled_state': ts,
             'cpu_temp': cpu_temp,
             'network': self.last_net_stats,
+            'system_cpu_usage': self.cpu_usage,
+            'system_uptime': time.clock_gettime(time.CLOCK_BOOTTIME),
+            'system_memory': self.memory_usage,
             'websocket_connections': websocket_count
         }
 
@@ -117,13 +136,14 @@ class ProcStats:
             ts = await self._check_throttled_state()
             logging.info(f"Throttled Flags: {' '.join(ts['flags'])}")
 
-    async def _handle_stat_update(self) -> None:
-        update_time = time.time()
+    async def _handle_stat_update(self, eventtime: float) -> float:
+        update_time = eventtime
         proc_time = time.process_time()
         time_diff = update_time - self.last_update_time
         usage = round((proc_time - self.last_proc_time) / time_diff * 100, 2)
-        cpu_temp, mem, mem_units, net = await self.event_loop.run_in_thread(
-            self._read_system_files)
+        cpu_temp, mem, mem_units, net = (
+            await self.event_loop.run_in_thread(self._read_system_files)
+        )
         for dev in net:
             bytes_sec = 0.
             if dev in self.last_net_stats:
@@ -135,25 +155,24 @@ class ProcStats:
             net[dev]['bandwidth'] = bytes_sec
         self.last_net_stats = net
         result = {
-            'time': update_time,
+            'time': time.time(),
             'cpu_usage': usage,
             'memory': mem,
             'mem_units': mem_units
         }
         self.proc_stat_queue.append(result)
-        websocket_count = self.server.get_websocket_manager().get_count()
+        wsm: WebsocketManager = self.server.lookup_component("websockets")
+        websocket_count = wsm.get_count()
         self.server.send_event("proc_stats:proc_stat_update", {
             'moonraker_stats': result,
             'cpu_temp': cpu_temp,
             'network': net,
+            'system_cpu_usage': self.cpu_usage,
+            'system_memory': self.memory_usage,
             'websocket_connections': websocket_count,
             "klippy_state": self.server.get_klippy_state()
         })
-        self.last_update_time = update_time
-        self.last_proc_time = proc_time
-        self.update_sequence += 1
-        if self.update_sequence == THROTTLE_CHECK_INTERVAL:
-            self.update_sequence = 0
+        if not self.update_sequence % THROTTLE_CHECK_INTERVAL:
             if self.vcgencmd is not None:
                 ts = await self._check_throttled_state()
                 cur_throttled = ts['bits']
@@ -164,8 +183,14 @@ class ProcStats:
                     self.server.send_event("proc_stats:cpu_throttled", ts)
                 self.last_throttled = cur_throttled
                 self.total_throttled |= cur_throttled
-            await self.machine.parse_network_interfaces()
-        await self.machine.update_service_status()
+        for cb in self.stat_callbacks:
+            ret = cb(self.update_sequence)
+            if ret is not None:
+                await ret
+        self.last_update_time = update_time
+        self.last_proc_time = proc_time
+        self.update_sequence += 1
+        return eventtime + STAT_UPDATE_TIME
 
     async def _check_throttled_state(self) -> Dict[str, Any]:
         async with self.throttle_check_lock:
@@ -186,6 +211,8 @@ class ProcStats:
         mem, units = self._get_memory_usage()
         temp = self._get_cpu_temperature()
         net_stats = self._get_net_stats()
+        self._update_cpu_stats()
+        self._update_system_memory()
         return temp, mem, units, net_stats
 
     def _get_memory_usage(self) -> Tuple[Optional[int], Optional[str]]:
@@ -201,32 +228,69 @@ class ProcStats:
         return mem, units
 
     def _get_cpu_temperature(self) -> Optional[float]:
-        temp = None
-        if self.temp_file.exists():
-            try:
-                res = int(self.temp_file.read_text().strip())
-                temp = res / 1000.
-            except Exception:
-                return None
+        try:
+            res = int(self.temp_file.read_text().strip())
+            temp = res / 1000.
+        except Exception:
+            return None
         return temp
 
     def _get_net_stats(self) -> Dict[str, Any]:
-        if self.netdev_file.exists():
-            net_stats: Dict[str, Any] = {}
-            try:
-                ret = self.netdev_file.read_text()
-                dev_info = re.findall(r"([\w]+):(.+)", ret)
-                for (dev_name, stats) in dev_info:
-                    parsed_stats = stats.strip().split()
-                    net_stats[dev_name] = {
-                        'rx_bytes': int(parsed_stats[0]),
-                        'tx_bytes': int(parsed_stats[8])
-                    }
-                return net_stats
-            except Exception:
-                return {}
-        else:
+        net_stats: Dict[str, Any] = {}
+        try:
+            ret = self.netdev_file.read_text()
+            dev_info = re.findall(r"([\w]+):(.+)", ret)
+            for (dev_name, stats) in dev_info:
+                parsed_stats = stats.strip().split()
+                net_stats[dev_name] = {
+                    'rx_bytes': int(parsed_stats[0]),
+                    'tx_bytes': int(parsed_stats[8]),
+                    'rx_packets': int(parsed_stats[1]),
+                    'tx_packets': int(parsed_stats[9]),
+                    'rx_errs': int(parsed_stats[2]),
+                    'tx_errs': int(parsed_stats[10]),
+                    'rx_drop': int(parsed_stats[3]),
+                    'tx_drop': int(parsed_stats[11])
+                }
+            return net_stats
+        except Exception:
             return {}
+
+    def _update_system_memory(self) -> None:
+        mem_stats: Dict[str, Any] = {}
+        try:
+            ret = self.meminfo_file.read_text()
+            total_match = re.search(r"MemTotal:\s+(\d+)", ret)
+            avail_match = re.search(r"MemAvailable:\s+(\d+)", ret)
+            if total_match is not None and avail_match is not None:
+                mem_stats["total"] = int(total_match.group(1))
+                mem_stats["available"] = int(avail_match.group(1))
+                mem_stats["used"] = mem_stats["total"] - mem_stats["available"]
+            self.memory_usage.update(mem_stats)
+        except Exception:
+            pass
+
+    def _update_cpu_stats(self) -> None:
+        try:
+            cpu_usage: Dict[str, Any] = {}
+            ret = self.cpu_stats_file.read_text()
+            usage_info: List[str] = re.findall(r"cpu[^\n]+", ret)
+            for cpu in usage_info:
+                parts = cpu.split()
+                name = parts[0]
+                cpu_sum = sum([int(t) for t in parts[1:]])
+                cpu_idle = int(parts[4])
+                if name in self.last_cpu_stats:
+                    last_sum, last_idle = self.last_cpu_stats[name]
+                    cpu_delta = cpu_sum - last_sum
+                    idle_delta = cpu_idle - last_idle
+                    cpu_used = cpu_delta - idle_delta
+                    cpu_usage[name] = round(
+                        100 * (cpu_used / cpu_delta), 2)
+                self.cpu_usage = cpu_usage
+                self.last_cpu_stats[name] = (cpu_sum, cpu_idle)
+        except Exception:
+            pass
 
     def _format_stats(self, stats: Dict[str, Any]) -> str:
         return f"System Time: {stats['time']:2f}, " \
@@ -241,39 +305,40 @@ class ProcStats:
         logging.info(msg)
 
     def close(self) -> None:
-        self.stat_update_cb.stop()
+        self.stat_update_timer.stop()
         self.watchdog.stop()
 
 class Watchdog:
     def __init__(self, proc_stats: ProcStats) -> None:
-        self.evt_loop = asyncio.get_event_loop()
         self.proc_stats = proc_stats
+        self.event_loop = proc_stats.event_loop
+        self.blocked_count: int = 0
         self.last_watch_time: float = 0.
-        self.wdcb_handle: Optional[asyncio.Handle] = None
+        self.watchdog_timer = self.event_loop.register_timer(
+            self._watchdog_callback
+        )
 
-    def _watchdog_callback(self) -> None:
-        cur_time = self.evt_loop.time()
-        time_diff = cur_time - self.last_watch_time
+    def _watchdog_callback(self, eventtime: float) -> float:
+        time_diff = eventtime - self.last_watch_time
         if time_diff > REPORT_BLOCKED_TIME:
+            self.blocked_count += 1
             logging.info(
-                f"EVENT LOOP BLOCKED: {round(time_diff, 2)} seconds")
+                f"EVENT LOOP BLOCKED: {round(time_diff, 2)} seconds"
+                f", total blocked count: {self.blocked_count}")
             # delay the stat logging so we capture the CPU percentage after
             # the next cycle
-            self.evt_loop.call_later(.2, self.proc_stats.log_last_stats, 5)
-        self.last_watch_time = cur_time
-        self.wdcb_handle = self.evt_loop.call_later(
-            WATCHDOG_REFRESH_TIME, self._watchdog_callback)
+            self.event_loop.delay_callback(
+                .2, self.proc_stats.log_last_stats, 5)
+        self.last_watch_time = eventtime
+        return eventtime + WATCHDOG_REFRESH_TIME
 
     def start(self):
-        if self.wdcb_handle is None:
-            self.last_watch_time = self.evt_loop.time()
-            self.wdcb_handle = self.evt_loop.call_soon(
-                self._watchdog_callback)
+        if not self.watchdog_timer.is_running():
+            self.last_watch_time = self.event_loop.get_loop_time()
+            self.watchdog_timer.start()
 
     def stop(self):
-        if self.wdcb_handle is not None:
-            self.wdcb_handle.cancel()
-            self.wdcb_handle = None
+        self.watchdog_timer.stop()
 
 def load_component(config: ConfigHelper) -> ProcStats:
     return ProcStats(config)

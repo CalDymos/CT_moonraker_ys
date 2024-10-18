@@ -2,6 +2,85 @@
 This file will track changes that require user intervention,
 such as a configuration change or a reinstallation.
 
+### Februrary 8th 2023
+- The `provider` option in the `[machine]` section no longer accepts
+  `supervisord` as an option.  It has been renamed to `supervisord_cli`.
+
+### January 2nd 2023
+- The `bound_service` option for `[power]` devices has been deprecated in
+  favor of `bound_services`.  Currently this change does not generate a
+  warning as it can be reliably resolved internally.
+
+### October 14th 2022
+- The systemd service file is now versioned.  Moonraker can now detect when
+  the file is out of date and automate corrections as necessary.
+- Moonraker's command line options are now specified in an environment file,
+  making it possible to change these options without modifying the service file
+  and reloading the systemd daemon.  The default location of the environment
+  file is `~/printer_data/systemd/moonraker.env`.
+- Moonraker now manages files and folders in a primary data folder supplied
+  by the `-d` (`--data-path`) command line option.  As a result, the following
+  options have been deprecated:
+    - `ssl_certificate_path` in `[server]`
+    - `ssl_key_path` in `[server]`
+    - `database_path` in `[database]`
+    - `config_path` in `[file_manager]`
+    - `log_path` in `[file_manager]`
+    - `secrets_path` in `[secrets]`
+- Debugging options are now supplied to Moonraker via the command line.
+  The `-v` (`--verbose`) option enables verbose logging, while the `-g`
+  (`--debug`) option enables debug features, including access to debug
+  endpoints and the repo debug feature in `update_manager`.  As a result,
+  the following options are deprecated:
+    - `enable_debug_logging` in `[server]`
+    - `enable_repo_debug` in `[update_manager]`
+
+### July 27th 2022
+- The behavior of `[include]` directives has changed.  Included files
+  are now parsed as they are encountered.  If sections are duplicated
+  options in the last section parsed take precendence.  If you are
+  using include directives to override configuration in `moonraker.conf`
+  the directives should be moved to the bottom of the file.
+- Configuration files now support inline comments.
+
+### April 6th 2022
+- The ability to configure core components in the `[server]`section
+  is now deprecated.  When legacy items are detected in `[server]` a
+  warning will be generated.  It is crucially important to move configuration
+  to the correct section as in the future it will be a hard requirement.
+
+### Feburary 22nd 2022
+- The `on_when_upload_queued` option for [power] devices has been
+  deprecated in favor of `on_when_job_queued`.  As the new option
+  name implies, this option will power on the device when any new
+  job is queued, not only when its sourced from an upload.  The
+  `on_when_upload_queued` option will be treated as an alias to
+  `on_when_job_queued` until its removal.
+
+### February 16th 2022
+- Webcam settings can now be defined in the `moonraker.conf` file, under
+  the `[octoprint_compat]` section. The default values are being used as
+  default values.
+
+  Default values:
+  | Setting | Default value |
+  |---------|---------------|
+  | flip_h | False |
+  | flip_v | False |
+  | rotate_90 | False |
+  | stream_url | /webcam/?action=stream |
+  | webcam_enabled | True |
+
+### January 22th 2022
+- The `color_order` option in the `[wled]` section has been deprecated.
+  This is configured in wled directly. This is not a breaking change,
+  the setting will simply be ignored not affecting functionality.
+
+### December 24th 2021
+- The `password_file` option in the `[mqtt]` section has been deprecated.
+  Use the `password` option instead.  This option may be a template, thus
+  can resolve secrets stored in the `[secrets]` module.
+
 ### November 7th 2021
 - Previously all core components received configuration through
   the `[server]` config section.  As Moonraker's core functionality
@@ -21,11 +100,11 @@ such as a configuration change or a reinstallation.
   if configured and disabled otherwise.
 - The API Key is now stored in the database.  This deprecates the
   `api_key_file` option in the `[authorization]` module.  Users can
-  no longer read the contents of the API Key file to retreive the
+  no longer read the contents of the API Key file to retrieve the
   API Key.  Instead, users can run `scripts/fetch-apikey.sh` to
   print the API Key.  Alternative a user can navigate to
   `http://{moonraker-host}/access/api_key` from a trusted client
-  to retreive the API Key.
+  to retrieve the API Key.
 
 ### March 10th 2021
 - The `cors_domain` option in the `[authoriztion]` section is now
@@ -40,7 +119,7 @@ such as a configuration change or a reinstallation.
   by Moonraker for the typical user.
 
 ### March 4th 2021
-- To enable Octoprint compatibility with slicer uploads it is now
+- To enable OctoPrint compatibility with slicer uploads it is now
   required to add `[octoprint_compat]` to `moonraker.conf`.  After
   making this change it is necessary to restart the Moonraker service
   so the module is loaded.

@@ -16,7 +16,7 @@ from typing import (
     List,
 )
 if TYPE_CHECKING:
-    from confighelper import ConfigHelper
+    from ..confighelper import ConfigHelper
     from .klippy_apis import KlippyAPI
 
 class JobState:
@@ -24,11 +24,13 @@ class JobState:
         self.server = config.get_server()
         self.last_print_stats: Dict[str, Any] = {}
         self.server.register_event_handler(
-            "server:klippy_ready", self._handle_ready)
+            "server:klippy_started", self._handle_started)
         self.server.register_event_handler(
             "server:status_update", self._status_update)
 
-    async def _handle_ready(self) -> None:
+    async def _handle_started(self, state: str) -> None:
+        if state != "ready":
+            return
         kapis: KlippyAPI = self.server.lookup_component('klippy_apis')
         sub: Dict[str, Optional[List[str]]] = {"print_stats": None}
         try:
@@ -36,6 +38,9 @@ class JobState:
         except self.server.error as e:
             logging.info(f"Error subscribing to print_stats")
         self.last_print_stats = result.get("print_stats", {})
+        if "state" in self.last_print_stats:
+            state = self.last_print_stats["state"]
+            logging.info(f"Job state initialized: {state}")
 
     async def _status_update(self, data: Dict[str, Any]) -> None:
         if 'print_stats' not in data:
@@ -54,9 +59,23 @@ class JobState:
                     if self._check_resumed(prev_ps, new_ps):
                         new_state = "resumed"
                     else:
+                        logging.info(
+                            f"Job Started: {new_ps['filename']}"
+                        )
                         new_state = "started"
+                logging.debug(
+                    f"Job State Changed - Prev State: {old_state}, "
+                    f"New State: {new_state}"
+                )
                 self.server.send_event(
                     f"job_state:{new_state}", prev_ps, new_ps)
+        if "info" in ps:
+            cur_layer: Optional[int] = ps["info"].get("current_layer")
+            if cur_layer is not None:
+                total: int = ps["info"].get("total_layer", 0)
+                self.server.send_event(
+                    "job_state:layer_changed", cur_layer, total
+                )
         self.last_print_stats.update(ps)
 
     def _check_resumed(self,

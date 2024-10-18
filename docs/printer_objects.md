@@ -4,13 +4,13 @@ As mentioned in the API documentation, it is possible to
 [subscribe](web_api.md#subscribe-to-printer-object-status)
 to "Klipper Printer Objects."  There are numerous printer objects in
 Klipper, many of which are optional and only report status if they are
-enabled by Klipper's configuration.  Client's may retreive a list of
+enabled by Klipper's configuration.  Client's may retrieve a list of
 available printer objects via the
 [list objects endpoint](web_api.md#list-available-printer-objects).  This
 should be done after Klipper reports its state as "ready".
 
 This section will provide an overview of the most useful printer objects.
-If a developer is interested in retreiving state for an object not listed here,
+If a developer is interested in retrieving state for an object not listed here,
 look in Klipper's source code for module you wish to query.  If the module
 contains a "get_status()" method, its return value will contain a dictionary
 that reports state which can be queried.
@@ -47,7 +47,7 @@ The `gcode_move` object reports the current gcode state:
 - `speed_factor`: AKA "feedrate", this is the current speed multiplier
 - `speed`: The current gcode speed in mm/s.
 - `extrude_factor`: AKA "extrusion multiplier".
-- `absolute_coorinates`: true if the machine axes are moved using
+- `absolute_coordinates`: true if the machine axes are moved using
   absolute coordinates, false if using relative coordinates.
 - `absolute_extrude`: true if the extruder is moved using absolute
   coordinates, false if using relative coordinates.
@@ -236,7 +236,11 @@ The `virtual_sdcard` object reports the state of the virtual sdcard:
     "print_duration": 0.0,
     "filament_used": 0.0,
     "state": "standby",
-    "message": ""
+    "message": "",
+    "info": {
+        "total_layer": null,
+        "current_layer": null
+    }
 }
 ```
 The `print_stats` object reports `virtual_sdcard` print state:
@@ -260,6 +264,17 @@ The `print_stats` object reports `virtual_sdcard` print state:
     - `"error"` - Note that if an error is detected the print will abort
 - `message`:  If an error is detected, this field contains the error
   message generated.  Otherwise it will be a null string.
+- `info`: This is a dict containing information about the print provided by the
+  slicer.  Currently this is limited to the `total_layer` and `current_layer` values.
+  Note that these values are set by the
+  [SET_PRINT_STATS_INFO](https://www.klipper3d.org/G-Codes.html#set_print_stats_info)
+  gcode command.  It is necessary to configure the slicer to include this command
+  in the print.  `SET_PRINT_STATS_INFO TOTAL_LAYER=total_layer_count` should
+  be called in the slicer's "start gcode" to initalize the total layer count.
+  `SET_PRINT_STATS_INFO CURRENT_LAYER=current_layer` should be called in the
+  slicer's "on layer change" gcode.  The user must substitute the
+  `total_layer_count` and `current_layer` with the appropriate
+  "placeholder syntax" for the slicer.
 
 !!! Note
     After a print has started all of the values above will persist until

@@ -548,7 +548,7 @@ class Timelapse:
             # prepare output filename
             now = datetime.now()
             date_time = now.strftime(self.config['time_format_code'])
-            outfile = f"timelapse_{gcodefilename}_{date_time}"
+            outfile = f"timelapse_{gcodefilename}_{date_time}{filename_extend}"
             outfileFull = outfile + "_frames.zip"
 
             zipObj = ZipFile(self.out_dir + outfileFull, "w")
@@ -612,7 +612,6 @@ class Timelapse:
             except Exception as e:
                 logging.exception(e)
                 output_framerate = 15
-
             # 生成视频前的图片文件列表补充缺失帧
             last_file_name = filelist[-1]
             last_number = int(last_file_name.split("frame")[1][:-4])
@@ -636,7 +635,6 @@ class Timelapse:
                         shutil.copyfile(source, target)
                 filelist = sorted(glob.glob(self.temp_dir + "frame*.jpg"))
                 self.framecount = len(filelist)
-
             self.renderisrunning = True
 
             # get printed filename
@@ -650,7 +648,7 @@ class Timelapse:
             date_time = now.strftime(self.config['time_format_code'])
             inputfiles = self.temp_dir + "frame%6d.jpg"
 
-            outfile = f"timelapse_{gcodefilename}_{date_time}{filename_extend}"
+            outfile = f"timelapse_{gcodefilename}_{date_time}"
 
             # dublicate last frame
             duplicates = []

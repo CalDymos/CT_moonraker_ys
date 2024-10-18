@@ -18,7 +18,6 @@ import re
 import socket
 import logging
 import json
-from tornado.ioloop import PeriodicCallback
 from tornado.web import HTTPError
 from libnacl.sign import Signer, Verifier
 
@@ -33,13 +32,15 @@ from typing import (
     Dict,
     List,
 )
+
 if TYPE_CHECKING:
-    from confighelper import ConfigHelper
-    from websockets import WebRequest
+    from ..confighelper import ConfigHelper
+    from ..common import WebRequest
+    from ..websockets import WebsocketManager
     from tornado.httputil import HTTPServerRequest
     from tornado.web import RequestHandler
-    from . import database
-    DBComp = database.MoonrakerDatabase
+    from .database import MoonrakerDatabase as DBComp
+    from .ldap import MoonrakerLDAP
     IPAddr = Union[ipaddress.IPv4Address, ipaddress.IPv6Address]
     IPNetwork = Union[ipaddress.IPv4Network, ipaddress.IPv6Network]
     OneshotToken = Tuple[IPAddr, Optional[Dict[str, Any]], asyncio.Handle]
@@ -57,8 +58,9 @@ def base64url_decode(data: str) -> bytes:
 
 ONESHOT_TIMEOUT = 5
 TRUSTED_CONNECTION_TIMEOUT = 3600
-PRUNE_CHECK_TIME = 300 * 1000
+PRUNE_CHECK_TIME = 300.
 
+AUTH_SOURCES = ["moonraker", "ldap"]
 HASH_ITER = 100000
 API_USER = "_API_KEY_USER_"
 TRUSTED_USER = "_TRUSTED_USER_"
@@ -74,9 +76,27 @@ class Authorization:
         self.server = config.get_server()
         self.login_timeout = config.getint('login_timeout', 90)
         self.force_logins = config.getboolean('force_logins', False)
+        self.default_source = config.get('default_source', "moonraker").lower()
+        self.enable_api_key = config.getboolean('enable_api_key', True)
+        self.max_logins = config.getint("max_login_attempts", None, above=0)
+        self.failed_logins: Dict[IPAddr, int] = {}
+        if self.default_source not in AUTH_SOURCES:
+            raise config.error(
+                "[authorization]: option 'default_source' - Invalid "
+                f"value '{self.default_source}'"
+            )
+        self.ldap: Optional[MoonrakerLDAP] = None
+        if config.has_section("ldap"):
+            self.ldap = self.server.load_component(config, "ldap", None)
+        if self.default_source == "ldap" and self.ldap is None:
+            self.server.add_warning(
+                "[authorization]: Option 'default_source' set to 'ldap',"
+                " however [ldap] section failed to load or not configured"
+            )
         database: DBComp = self.server.lookup_component('database')
         database.register_local_namespace('authorized_users', forbidden=True)
-        self.users = database.wrap_namespace('authorized_users')
+        self.user_db = database.wrap_namespace('authorized_users')
+        self.users: Dict[str, Dict[str, Any]] = self.user_db.as_dict()
         api_user: Optional[Dict[str, Any]] = self.users.get(API_USER, None)
         if api_user is None:
             self.api_key = uuid.uuid4().hex
@@ -127,7 +147,8 @@ class Authorization:
                     self.users[username] = user_info
                     continue
                 self.public_jwks[jwk_id] = self._generate_public_jwk(priv_key)
-
+        # sync user changes to the database
+        self.user_db.sync(self.users)
         self.trusted_users: Dict[IPAddr, Any] = {}
         self.oneshot_tokens: Dict[str, OneshotToken] = {}
         self.permitted_paths: Set[str] = set()
@@ -142,9 +163,9 @@ class Authorization:
                     " permitted in the top level domain.")
             if domain.endswith("/"):
                 self.server.add_warning(
-                    f"Invalid domain '{domain}' in option 'cors_domains',  "
-                    "section [authorization].  Domain's cannot contain a "
-                    "trailing slash.")
+                    f"[authorization]: Invalid domain '{domain}' in option "
+                    "'cors_domains'.  Domain's cannot contain a trailing "
+                    "slash.")
             else:
                 self.cors_domains.append(
                     domain.replace(".", "\\.").replace("*", ".*"))
@@ -164,14 +185,25 @@ class Authorization:
                 continue
             # Check ip network
             try:
-                tc = ipaddress.ip_network(val)
-            except ValueError:
+                tn = ipaddress.ip_network(val)
+            except ValueError as e:
+                if "has host bits set" in str(e):
+                    self.server.add_warning(
+                        f"[authorization]: Invalid CIDR expression '{val}' "
+                        "in option 'trusted_clients'")
+                    continue
                 pass
             else:
-                self.trusted_ranges.append(tc)
+                self.trusted_ranges.append(tn)
                 continue
             # Check hostname
-            self.trusted_domains.append(val.lower())
+            match = re.match(r"([a-z0-9]+(-[a-z0-9]+)*\.?)+[a-z]{2,}$", val)
+            if match is not None:
+                self.trusted_domains.append(val.lower())
+            else:
+                self.server.add_warning(
+                    f"[authorization]: Invalid domain name '{val}' "
+                    "in option 'trusted_clients'")
 
         t_clients = "\n".join(
             [str(ip) for ip in self.trusted_ips] +
@@ -184,46 +216,69 @@ class Authorization:
             f"Trusted Clients:\n{t_clients}\n"
             f"CORS Domains:\n{c_domains}")
 
-        self.prune_handler = PeriodicCallback(
-            self._prune_conn_handler, PRUNE_CHECK_TIME)
-        self.prune_handler.start()
+        eventloop = self.server.get_event_loop()
+        self.prune_timer = eventloop.register_timer(
+            self._prune_conn_handler)
 
         # Register Authorization Endpoints
         self.permitted_paths.add("/server/redirect")
         self.permitted_paths.add("/access/login")
         self.permitted_paths.add("/access/refresh_jwt")
+        self.permitted_paths.add("/access/info")
         self.server.register_endpoint(
             "/access/login", ['POST'], self._handle_login,
-            transports=['http'])
+            transports=['http', 'websocket'])
         self.server.register_endpoint(
             "/access/logout", ['POST'], self._handle_logout,
-            transports=['http'])
+            transports=['http', 'websocket'])
         self.server.register_endpoint(
             "/access/refresh_jwt", ['POST'], self._handle_refresh_jwt,
-            transports=['http'])
+            transports=['http', 'websocket'])
         self.server.register_endpoint(
             "/access/user", ['GET', 'POST', 'DELETE'],
-            self._handle_user_request, transports=['http'])
+            self._handle_user_request, transports=['http', 'websocket'])
         self.server.register_endpoint(
             "/access/users/list", ['GET'], self._handle_list_request,
-            transports=['http'])
+            transports=['http', 'websocket'])
         self.server.register_endpoint(
             "/access/user/password", ['POST'], self._handle_password_reset,
-            transports=['http'])
+            transports=['http', 'websocket'])
         self.server.register_endpoint(
             "/access/api_key", ['GET', 'POST'],
-            self._handle_apikey_request, transports=['http'])
+            self._handle_apikey_request, transports=['http', 'websocket'])
         self.server.register_endpoint(
             "/access/oneshot_token", ['GET'],
-            self._handle_oneshot_request, transports=['http'])
-        self.server.register_notification("authorization:user_created")
-        self.server.register_notification("authorization:user_deleted")
+            self._handle_oneshot_request, transports=['http', 'websocket'])
+        self.server.register_endpoint(
+            "/access/info", ['GET'],
+            self._handle_info_request, transports=['http', 'websocket'])
+        wsm: WebsocketManager = self.server.lookup_component("websockets")
+        wsm.register_notification("authorization:user_created")
+        wsm.register_notification(
+            "authorization:user_deleted", event_type="logout"
+        )
+        wsm.register_notification(
+            "authorization:user_logged_out", event_type="logout"
+        )
+
+    def register_permited_path(self, path: str) -> None:
+        self.permitted_paths.add(path)
+
+    def is_path_permitted(self, path: str) -> bool:
+        return path in self.permitted_paths
+
+    def _sync_user(self, username: str) -> None:
+        self.user_db[username] = self.users[username]
+
+    async def component_init(self) -> None:
+        self.prune_timer.start(delay=PRUNE_CHECK_TIME)
 
     async def _handle_apikey_request(self, web_request: WebRequest) -> str:
         action = web_request.get_action()
         if action.upper() == 'POST':
             self.api_key = uuid.uuid4().hex
-            self.users[f'{API_USER}.api_key'] = self.api_key
+            self.users[API_USER]['api_key'] = self.api_key
+            self._sync_user(API_USER)
         return self.api_key
 
     async def _handle_oneshot_request(self, web_request: WebRequest) -> str:
@@ -233,7 +288,23 @@ class Authorization:
         return self.get_oneshot_token(ip, user_info)
 
     async def _handle_login(self, web_request: WebRequest) -> Dict[str, Any]:
-        return self._login_jwt_user(web_request)
+        ip = web_request.get_ip_address()
+        if ip is not None and self.check_logins_maxed(ip):
+            raise HTTPError(
+                401, "Unauthorized, Maximum Login Attempts Reached"
+            )
+        try:
+            ret = await self._login_jwt_user(web_request)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            if ip is not None:
+                failed = self.failed_logins.get(ip, 0)
+                self.failed_logins[ip] = failed + 1
+            raise
+        if ip is not None:
+            self.failed_logins.pop(ip, None)
+        return ret
 
     async def _handle_logout(self, web_request: WebRequest) -> Dict[str, str]:
         user_info = web_request.get_current_user()
@@ -243,12 +314,29 @@ class Authorization:
         if username in RESERVED_USERS:
             raise self.server.error(
                 f"Invalid log out request for user {username}")
-        self.users.pop(f"{username}.jwt_secret", None)
-        jwk_id: str = self.users.pop(f"{username}.jwk_id", "")
+        self.users[username].pop("jwt_secret", None)
+        jwk_id: str = self.users[username].pop("jwk_id", None)
+        self._sync_user(username)
         self.public_jwks.pop(jwk_id, None)
+        eventloop = self.server.get_event_loop()
+        eventloop.delay_callback(
+            .005, self.server.send_event, "authorization:user_logged_out",
+            {'username': username}
+        )
         return {
             "username": username,
             "action": "user_logged_out"
+        }
+
+    async def _handle_info_request(
+        self, web_request: WebRequest
+    ) -> Dict[str, Any]:
+        sources = ["moonraker"]
+        if self.ldap is not None:
+            sources.append("ldap")
+        return {
+            "default_source": self.default_source,
+            "available_sources": sources
         }
 
     async def _handle_refresh_jwt(self,
@@ -256,7 +344,7 @@ class Authorization:
                                   ) -> Dict[str, str]:
         refresh_token: str = web_request.get_str('refresh_token')
         try:
-            user_info = self._decode_jwt(refresh_token, token_type="refresh")
+            user_info = self.decode_jwt(refresh_token, token_type="refresh")
         except Exception:
             raise self.server.error("Invalid Refresh Token", 401)
         username: str = user_info['username']
@@ -268,6 +356,7 @@ class Authorization:
         return {
             'username': username,
             'token': token,
+            'source': user_info.get("source", "moonraker"),
             'action': 'user_jwt_refresh'
         }
 
@@ -280,16 +369,18 @@ class Authorization:
             if user is None:
                 return {
                     'username': None,
+                    'source': None,
                     'created_on': None,
                 }
             else:
                 return {
                     'username': user['username'],
+                    'source': user.get("source", "moonraker"),
                     'created_on': user.get('created_on')
                 }
         elif action == "POST":
             # Create User
-            return self._login_jwt_user(web_request, create=True)
+            return await self._login_jwt_user(web_request, create=True)
         elif action == "DELETE":
             # Delete User
             return self._delete_jwt_user(web_request)
@@ -304,6 +395,7 @@ class Authorization:
                 continue
             user_list.append({
                 'username': user['username'],
+                'source': user.get("source", "moonraker"),
                 'created_on': user['created_on']
             })
         return {
@@ -319,6 +411,9 @@ class Authorization:
         if user_info is None:
             raise self.server.error("No Current User")
         username = user_info['username']
+        if user_info.get("source", "moonraker") == "ldap":
+            raise self.server.error(
+                f"Can´t Reset password for ldap user {username}")
         if username in RESERVED_USERS:
             raise self.server.error(
                 f"Invalid Reset Request for user {username}")
@@ -329,22 +424,37 @@ class Authorization:
             raise self.server.error("Invalid Password")
         new_hashed_pass = hashlib.pbkdf2_hmac(
             'sha256', new_pass.encode(), salt, HASH_ITER).hex()
-        self.users[f'{username}.password'] = new_hashed_pass
+        self.users[username]['password'] = new_hashed_pass
+        self._sync_user(username)
         return {
             'username': username,
             'action': "user_password_reset"
         }
 
-    def _login_jwt_user(self,
-                        web_request: WebRequest,
-                        create: bool = False
-                        ) -> Dict[str, Any]:
+    async def _login_jwt_user(
+        self, web_request: WebRequest, create: bool = False
+    ) -> Dict[str, Any]:
         username: str = web_request.get_str('username')
         password: str = web_request.get_str('password')
+        source: str = web_request.get_str(
+            'source', self.default_source
+        ).lower()
+        if source not in AUTH_SOURCES:
+            raise self.server.error(f"Invalid 'source': {source}")
         user_info: Dict[str, Any]
         if username in RESERVED_USERS:
             raise self.server.error(
                 f"Invalid Request for user {username}")
+        if source == "ldap":
+            if create:
+                raise self.server.error("Cannot Create LDAP User")
+            if self.ldap is None:
+                raise self.server.error(
+                    "LDAP authentication not available", 401
+                )
+            await self.ldap.authenticate_ldap_user(username, password)
+            if username not in self.users:
+                create = True
         if create:
             if username in self.users:
                 raise self.server.error(f"User {username} already exists")
@@ -355,20 +465,32 @@ class Authorization:
                 'username': username,
                 'password': hashed_pass,
                 'salt': salt.hex(),
+                'source': source,
                 'created_on': time.time()
             }
             self.users[username] = user_info
+            self._sync_user(username)
             action = "user_created"
+            if source == "ldap":
+                # Dont notify user created
+                action = "user_logged_in"
+                create = False
         else:
             if username not in self.users:
                 raise self.server.error(f"Unregistered User: {username}")
             user_info = self.users[username]
+            auth_src = user_info.get("source", "moonraker")
+            if auth_src != source:
+                raise self.server.error(
+                    f"Moonraker cannot authenticate user '{username}', must "
+                    f"specify source '{auth_src}'", 401
+                )
             salt = bytes.fromhex(user_info['salt'])
             hashed_pass = hashlib.pbkdf2_hmac(
                 'sha256', password.encode(), salt, HASH_ITER).hex()
             action = "user_logged_in"
-        if hashed_pass != user_info['password']:
-            raise self.server.error("Invalid Password")
+            if hashed_pass != user_info['password']:
+                raise self.server.error("Invalid Password")
         jwt_secret_hex: Optional[str] = user_info.get('jwt_secret', None)
         if jwt_secret_hex is None:
             private_key = Signer()
@@ -376,6 +498,7 @@ class Authorization:
             user_info['jwt_secret'] = private_key.hex_seed().decode()
             user_info['jwk_id'] = jwk_id
             self.users[username] = user_info
+            self._sync_user(username)
             self.public_jwks[jwk_id] = self._generate_public_jwk(private_key)
         else:
             private_key = self._load_private_key(jwt_secret_hex)
@@ -384,15 +507,19 @@ class Authorization:
         refresh_token = self._generate_jwt(
             username, jwk_id, private_key, token_type="refresh",
             exp_time=datetime.timedelta(days=self.login_timeout))
+        conn = web_request.get_client_connection()
         if create:
             event_loop = self.server.get_event_loop()
             event_loop.delay_callback(
                 .005, self.server.send_event,
                 "authorization:user_created",
                 {'username': username})
+        elif conn is not None:
+            conn.user_info = user_info
         return {
             'username': username,
             'token': token,
+            'source': user_info.get("source", "moonraker"),
             'refresh_token': refresh_token,
             'action': action
         }
@@ -411,8 +538,10 @@ class Authorization:
         user_info: Optional[Dict[str, Any]] = self.users.get(username)
         if user_info is None:
             raise self.server.error(f"No registered user: {username}")
-        self.public_jwks.pop(self.users.get(f"{username}.jwk_id"), None)
+        if 'jwk_id' in user_info:
+            self.public_jwks.pop(user_info['jwk_id'], None)
         del self.users[username]
+        del self.user_db[username]
         event_loop = self.server.get_event_loop()
         event_loop.delay_callback(
             .005, self.server.send_event,
@@ -448,10 +577,9 @@ class Authorization:
         jwt_sig = base64url_encode(sig)
         return b".".join([jwt_msg, jwt_sig]).decode()
 
-    def _decode_jwt(self,
-                    token: str,
-                    token_type: str = "access"
-                    ) -> Dict[str, Any]:
+    def decode_jwt(
+        self, token: str, token_type: str = "access"
+    ) -> Dict[str, Any]:
         message, sig = token.rsplit('.', maxsplit=1)
         enc_header, enc_payload = message.split('.')
         header: Dict[str, Any] = json.loads(base64url_decode(enc_header))
@@ -488,6 +616,24 @@ class Authorization:
             raise self.server.error("Unknown user", 401)
         return user_info
 
+    def validate_jwt(self, token: str) -> Dict[str, Any]:
+        try:
+            user_info = self.decode_jwt(token)
+        except Exception as e:
+            if isinstance(e, self.server.error):
+                raise
+            raise self.server.error(
+                f"Failed to decode JWT: {e}", 401
+            ) from e
+        return user_info
+
+    def validate_api_key(self, api_key: str) -> Dict[str, Any]:
+        if not self.enable_api_key:
+            raise self.server.error("API Key authentication is disabled", 401)
+        if api_key and api_key == self.api_key:
+            return self.users[API_USER]
+        raise self.server.error("Invalid API Key", 401)
+
     def _load_private_key(self, secret: str) -> Signer:
         try:
             key = Signer(bytes.fromhex(secret))
@@ -516,7 +662,7 @@ class Authorization:
         key = base64url_decode(jwk['x'])
         return Verifier(key.hex().encode())
 
-    def _prune_conn_handler(self) -> None:
+    def _prune_conn_handler(self, eventtime: float) -> float:
         cur_time = time.time()
         for ip, user_info in list(self.trusted_users.items()):
             exp_time: float = user_info['expires_at']
@@ -524,6 +670,7 @@ class Authorization:
                 self.trusted_users.pop(ip, None)
                 logging.info(
                     f"Trusted Connection Expired, IP: {ip}")
+        return eventtime + PRUNE_CHECK_TIME
 
     def _oneshot_token_expire_handler(self, token):
         self.oneshot_tokens.pop(token, None)
@@ -549,20 +696,16 @@ class Authorization:
                 qtoken = request.query_arguments.get('access_token', None)
                 if qtoken is not None:
                     auth_token = qtoken[-1].decode()
+        elif auth_token.startswith("Bearer "):
+            auth_token = auth_token[7:]
         else:
-            if auth_token.startswith("Bearer "):
-                auth_token = auth_token[7:]
-            elif auth_token.startswith("Basic "):
-                raise HTTPError(401, "Basic Auth is not supported")
-            else:
-                raise HTTPError(
-                    401, f"Invalid Authorization Header: {auth_token}")
+            return None
         if auth_token:
             try:
-                return self._decode_jwt(auth_token)
+                return self.decode_jwt(auth_token)
             except Exception:
                 logging.exception(f"JWT Decode Error {auth_token}")
-                raise HTTPError(401, f"Error decoding JWT: {auth_token}")
+                raise HTTPError(401, "JWT Decode Error")
         return None
 
     def _check_authorized_ip(self, ip: IPAddr) -> bool:
@@ -630,7 +773,7 @@ class Authorization:
 
     def _check_oneshot_token(self,
                              token: str,
-                             cur_ip: IPAddr
+                             cur_ip: Optional[IPAddr]
                              ) -> Optional[Dict[str, Any]]:
         if token in self.oneshot_tokens:
             ip_addr, user, hdl = self.oneshot_tokens.pop(token)
@@ -643,11 +786,18 @@ class Authorization:
         else:
             return None
 
+    def check_logins_maxed(self, ip_addr: IPAddr) -> bool:
+        if self.max_logins is None:
+            return False
+        return self.failed_logins.get(ip_addr, 0) >= self.max_logins
+
     def check_authorized(self,
                          request: HTTPServerRequest
                          ) -> Optional[Dict[str, Any]]:
-        if request.path in self.permitted_paths or \
-                request.method == "OPTIONS":
+        if (
+            request.path in self.permitted_paths
+            or request.method == "OPTIONS"
+        ):
             return None
 
         # Check JSON Web Token
@@ -656,7 +806,7 @@ class Authorization:
             return jwt_user
 
         try:
-            ip = ipaddress.ip_address(request.remote_ip)
+            ip = ipaddress.ip_address(request.remote_ip)  # type: ignore
         except ValueError:
             logging.exception(
                 f"Unable to Create IP Address {request.remote_ip}")
@@ -670,14 +820,15 @@ class Authorization:
                 return ost_user
 
         # Check API Key Header
-        key: Optional[str] = request.headers.get("X-Api-Key")
-        if key and key == self.api_key:
-            return self.users[API_USER]
+        if self.enable_api_key:
+            key: Optional[str] = request.headers.get("X-Api-Key")
+            if key and key == self.api_key:
+                return self.users[API_USER]
 
         # If the force_logins option is enabled and at least one
         # user is created this is an unauthorized request
         if self.force_logins and len(self.users) > 1:
-            raise HTTPError(401, "Unauthorized")
+            raise HTTPError(401, "Unauthorized, Force Logins Enabled")
 
         # Check if IP is trusted
         trusted_user = self._check_trusted_connection(ip)
@@ -737,11 +888,19 @@ class Authorization:
                 "Access-Control-Allow-Headers",
                 "Origin, Accept, Content-Type, X-Requested-With, "
                 "X-CRSF-Token, Authorization, X-Access-Token, "
-                 "CXSW-OS-LANG, HTTP-CXSW-OS-LANG, CXSW_ORIGIN, HTTP-CXSW-ORIGIN,"
+                "CXSW-OS-LANG, HTTP-CXSW-OS-LANG, CXSW_ORIGIN, HTTP-CXSW-ORIGIN,"
                 "X-Api-Key")
+            if req_hdlr.request.headers.get(
+                    "Access-Control-Request-Private-Network", None) == "true":
+                req_hdlr.set_header(
+                    "Access-Control-Allow-Private-Network",
+                    "true")
+
+    def cors_enabled(self) -> bool:
+        return self.cors_domains is not None
 
     def close(self) -> None:
-        self.prune_handler.stop()
+        self.prune_timer.stop()
 
 
 def load_component(config: ConfigHelper) -> Authorization:

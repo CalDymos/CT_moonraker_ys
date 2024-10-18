@@ -5,8 +5,8 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 
 from __future__ import annotations
-from utils import SentinelClass
-from websockets import WebRequest, Subscribable
+from ..utils import Sentinel
+from ..common import WebRequest, Subscribable
 
 # Annotation imports
 from typing import (
@@ -20,8 +20,8 @@ from typing import (
     Mapping,
 )
 if TYPE_CHECKING:
-    from confighelper import ConfigHelper
-    from websockets import WebRequest
+    from ..confighelper import ConfigHelper
+    from ..klippy_connection import KlippyConnection as Klippy
     Subscription = Dict[str, Optional[List[Any]]]
     _T = TypeVar("_T")
 
@@ -34,11 +34,11 @@ SUBSCRIPTION_ENDPOINT = "objects/subscribe"
 STATUS_ENDPOINT = "objects/query"
 OBJ_LIST_ENDPOINT = "objects/list"
 REG_METHOD_ENDPOINT = "register_remote_method"
-SENTINEL = SentinelClass.get_instance()
 
 class KlippyAPI(Subscribable):
     def __init__(self, config: ConfigHelper) -> None:
         self.server = config.get_server()
+        self.klippy: Klippy = self.server.lookup_component("klippy_connection")
         app_args = self.server.get_app_args()
         self.version = app_args.get('software_version')
         # Maintain a subscription for all moonraker requests, as
@@ -58,18 +58,55 @@ class KlippyAPI(Subscribable):
             "/printer/restart", ['POST'], self._gcode_restart)
         self.server.register_endpoint(
             "/printer/firmware_restart", ['POST'], self._gcode_firmware_restart)
+        self.server.register_endpoint(
+            "/printer/extruder_rotation_distance", ['GET'], self._get_extruder_rotation_distance)
+        self.server.register_endpoint(
+            "/printer/extruder_gear_ratio", ['GET'], self._get_extruder_gear_ratio)
+        self.server.register_endpoint(
+            "/printer/set_extruder_rotation_distance", ['POST'], self._set_extruder_rotation_distance)
+        self.server.register_endpoint(
+            "/printer/set_extruder_gear_ratio", ['POST'], self._set_extruder_gear_ratio)
+
+    async def _get_extruder_rotation_distance(self, web_request: WebRequest) -> str:
+        return await self._send_klippy_request("extruder_rotation_distance", {})
+    
+    async def _get_extruder_gear_ratio(self, web_request: WebRequest) -> str:
+        return await self._send_klippy_request("extruder_gear_ratio", {})
+    
+    async def _set_extruder_rotation_distance(self, web_request: WebRequest) -> str:
+        params = {"rotation_distance": web_request.get('rotation_distance')}
+        return await self._send_klippy_request("set_extruder_rotation_distance", params)
+    
+    async def _set_extruder_gear_ratio(self, web_request: WebRequest) -> str:
+        params = {"Molecule": web_request.get('Molecule'), "Denominator": web_request.get('Denominator')}
+        return await self._send_klippy_request("set_extruder_gear_ratio", params)
 
     async def _gcode_pause(self, web_request: WebRequest) -> str:
-        return await self._send_klippy_request("pause_resume/pause", {})
+        return await self.pause_print()
 
     async def _gcode_resume(self, web_request: WebRequest) -> str:
-        return await self._send_klippy_request("pause_resume/resume", {})
+        return await self.resume_print()
 
     async def _gcode_cancel(self, web_request: WebRequest) -> str:
-        return await self._send_klippy_request("pause_resume/cancel", {})
+        return await self.cancel_print()
 
     async def _gcode_start_print(self, web_request: WebRequest) -> str:
         filename: str = web_request.get_str('filename')
+        # import logging
+        # import os
+        # logging.info(f"++++++++++++++++++print filename:{filename}")
+        # replace_str = "$~!@#%^&*<>,?)(- "
+        # no_start_str = "."
+        # for i in replace_str:
+        #     if i in filename:
+        #         if not os.path.exists("/mnt/UDISK/.crealityprint/upload" + filename):
+        #             filename = filename.replace(i, "")
+        # if "\\" in filename:
+        #     filename = filename.replace("\\", "")
+        # if filename[1:].startswith(no_start_str):
+        #     if not os.path.exists("/mnt/UDISK/.crealityprint/upload" + filename):
+        #         filename = "/" + filename[2:]
+        # logging.info(f"++++++++++++++++++send print filename:{filename}")
         return await self.start_print(filename)
 
     async def _gcode_restart(self, web_request: WebRequest) -> str:
@@ -78,41 +115,79 @@ class KlippyAPI(Subscribable):
     async def _gcode_firmware_restart(self, web_request: WebRequest) -> str:
         return await self.do_restart("FIRMWARE_RESTART")
 
-    async def _send_klippy_request(self,
-                                   method: str,
-                                   params: Dict[str, Any],
-                                   default: Any = SENTINEL
-                                   ) -> Any:
+    async def _send_klippy_request(
+        self,
+        method: str,
+        params: Dict[str, Any],
+        default: Any = Sentinel.MISSING
+    ) -> Any:
         try:
-            result = await self.server.make_request(
-                WebRequest(method, params, conn=self))
+            req = WebRequest(method, params, conn=self)
+            result = await self.klippy.request(req)
         except self.server.error:
-            if isinstance(default, SentinelClass):
+            if default is Sentinel.MISSING:
                 raise
             result = default
         return result
 
     async def run_gcode(self,
                         script: str,
-                        default: Any = SENTINEL
+                        default: Any = Sentinel.MISSING
                         ) -> str:
         params = {'script': script}
         result = await self._send_klippy_request(
             GCODE_ENDPOINT, params, default)
         return result
 
-    async def start_print(self, filename: str) -> str:
+    async def start_print(
+        self, filename: str, wait_klippy_started: bool = False
+    ) -> str:
+        # WARNING: Do not call this method from within the following
+        # event handlers when "wait_klippy_started" is set to True:
+        # klippy_identified, klippy_started, klippy_ready, klippy_disconnect
+        # Doing so will result in "wait_started" blocking for the specifed
+        # timeout (default 20s) and returning False.
         # XXX - validate that file is on disk
         if filename[0] == '/':
             filename = filename[1:]
         # Escape existing double quotes in the file name
         filename = filename.replace("\"", "\\\"")
         script = f'SDCARD_PRINT_FILE FILENAME="{filename}"'
-        await self.server.wait_connection_initialized()
+        if wait_klippy_started:
+            await self.klippy.wait_started()
         return await self.run_gcode(script)
 
-    async def do_restart(self, gc: str) -> str:
-        await self.server.wait_connection_initialized()
+    async def pause_print(
+        self, default: Union[Sentinel, _T] = Sentinel.MISSING
+    ) -> Union[_T, str]:
+        self.server.send_event("klippy_apis:pause_requested")
+        return await self._send_klippy_request(
+            "pause_resume/pause", {}, default)
+
+    async def resume_print(
+        self, default: Union[Sentinel, _T] = Sentinel.MISSING
+    ) -> Union[_T, str]:
+        self.server.send_event("klippy_apis:resume_requested")
+        return await self._send_klippy_request(
+            "pause_resume/resume", {}, default)
+
+    async def cancel_print(
+        self, default: Union[Sentinel, _T] = Sentinel.MISSING
+    ) -> Union[_T, str]:
+        self.server.send_event("klippy_apis:cancel_requested")
+        return await self._send_klippy_request(
+            "pause_resume/cancel", {}, default)
+
+    async def do_restart(
+        self, gc: str, wait_klippy_started: bool = False
+    ) -> str:
+        # WARNING: Do not call this method from within the following
+        # event handlers when "wait_klippy_started" is set to True:
+        # klippy_identified, klippy_started, klippy_ready, klippy_disconnect
+        # Doing so will result in "wait_started" blocking for the specifed
+        # timeout (default 20s) and returning False.
+        if wait_klippy_started:
+            await self.klippy.wait_started()
         try:
             result = await self.run_gcode(gc)
         except self.server.error as e:
@@ -123,7 +198,7 @@ class KlippyAPI(Subscribable):
         return result
 
     async def list_endpoints(self,
-                             default: Union[SentinelClass, _T] = SENTINEL
+                             default: Union[Sentinel, _T] = Sentinel.MISSING
                              ) -> Union[_T, Dict[str, List[str]]]:
         return await self._send_klippy_request(
             LIST_EPS_ENDPOINT, {}, default)
@@ -133,7 +208,7 @@ class KlippyAPI(Subscribable):
 
     async def get_klippy_info(self,
                               send_id: bool = False,
-                              default: Union[SentinelClass, _T] = SENTINEL
+                              default: Union[Sentinel, _T] = Sentinel.MISSING
                               ) -> Union[_T, Dict[str, Any]]:
         params = {}
         if send_id:
@@ -142,28 +217,32 @@ class KlippyAPI(Subscribable):
         return await self._send_klippy_request(INFO_ENDPOINT, params, default)
 
     async def get_object_list(self,
-                              default: Union[SentinelClass, _T] = SENTINEL
+                              default: Union[Sentinel, _T] = Sentinel.MISSING
                               ) -> Union[_T, List[str]]:
         result = await self._send_klippy_request(
             OBJ_LIST_ENDPOINT, {}, default)
         if isinstance(result, dict) and 'objects' in result:
             return result['objects']
-        return result
+        if default is not Sentinel.MISSING:
+            return default
+        raise self.server.error("Invalid response received from Klippy", 500)
 
     async def query_objects(self,
                             objects: Mapping[str, Optional[List[str]]],
-                            default: Union[SentinelClass, _T] = SENTINEL
+                            default: Union[Sentinel, _T] = Sentinel.MISSING
                             ) -> Union[_T, Dict[str, Any]]:
         params = {'objects': objects}
         result = await self._send_klippy_request(
             STATUS_ENDPOINT, params, default)
         if isinstance(result, dict) and 'status' in result:
             return result['status']
-        return result
+        if default is not Sentinel.MISSING:
+            return default
+        raise self.server.error("Invalid response received from Klippy", 500)
 
     async def subscribe_objects(self,
                                 objects: Mapping[str, Optional[List[str]]],
-                                default: Union[SentinelClass, _T] = SENTINEL
+                                default: Union[Sentinel, _T] = Sentinel.MISSING
                                 ) -> Union[_T, Dict[str, Any]]:
         for obj, items in objects.items():
             if obj in self.host_subscription:
@@ -180,7 +259,9 @@ class KlippyAPI(Subscribable):
             SUBSCRIPTION_ENDPOINT, params, default)
         if isinstance(result, dict) and 'status' in result:
             return result['status']
-        return result
+        if default is not Sentinel.MISSING:
+            return default
+        raise self.server.error("Invalid response received from Klippy", 500)
 
     async def subscribe_gcode_output(self) -> str:
         template = {'response_template':
